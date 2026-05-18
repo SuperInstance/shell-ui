@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Terax Shell</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#b3b1ad;font-family:'SF Mono','Fira Code','Consolas',monospace;font-size:14px;line-height:1.5}
+#app{display:flex;flex-direction:column;height:100vh}
+header{background:#0d1117;border-bottom:1px solid #1c2128;padding:8px 16px;display:flex;align-items:center;gap:16px;flex-shrink:0}
+header h1{color:#e6e1cf;font-size:16px;font-weight:600;margin:0}
+nav{display:flex;gap:4px}
+nav button{background:none;border:1px solid transparent;color:#6e7681;padding:4px 12px;cursor:pointer;border-radius:4px;font-size:13px;font-family:inherit}
+nav button.active,nav button:hover{color:#e6e1cf;border-color:#30363d;background:#161b22}
+#content{flex:1;overflow-y:auto;padding:16px}
+h2{color:#e6e1cf;font-size:15px;margin-bottom:12px}
+.card{background:#0d1117;border:1px solid #1c2128;border-radius:6px;padding:12px;margin-bottom:12px}
+label{display:block;color:#8b949e;font-size:12px;margin-bottom:4px}
+input,textarea,select{width:100%;background:#161b22;border:1px solid #30363d;color:#e6e1cf;padding:8px;border-radius:4px;font-family:inherit;font-size:13px}
+input:focus,textarea:focus{outline:none;border-color:#58a6ff}
+textarea{min-height:60px;resize:vertical}
+button.primary{background:#238636;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:13px;font-family:inherit}
+button.primary:hover{background:#2ea043}
+button.secondary{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:13px;font-family:inherit}
+button.secondary:hover{background:#30363d}
+button.danger{background:#da3633;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:13px;font-family:inherit}
+button:disabled{opacity:.5;cursor:not-allowed}
+pre{background:#161b22;border:1px solid #30363d;border-radius:4px;padding:8px;overflow:auto;max-height:400px;font-size:12px;white-space:pre-wrap;word-break:break-all;color:#b3b1ad}
+code{font-family:inherit}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.status-up{background:#3fb950}
+.status-down{background:#da3633}
+.status-bar{background:#0d1117;border-top:1px solid #1c2128;padding:4px 16px;display:flex;gap:16px;font-size:11px;color:#8b949e;flex-shrink:0}
+.inline-flex{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.mt-8{margin-top:8px}
+.mb-8{margin-bottom:8px}
+.hidden{display:none}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:768px){.grid-2{grid-template-columns:1fr}}
+</style>
+</head>
+<body><div id="app"></div>
+<script>
+const API = 'http://localhost:8410';
+let activeTab = 'shell';
+let shellSessions = {};
+let bgProcesses = [];
+
+async function api(path, opts = {}) {
+  const url = path.startsWith('http') ? path : `${API}${path}`;
+  const resp = await fetch(url, {
+    ...opts,
+    headers: {'Content-Type': 'application/json', ...opts.headers},
+    signal: AbortSignal.timeout(opts.timeout || 10000),
+  });
+  if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+  return resp.json();
+}
+
+function $(id) { return document.getElementById(id); }
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  Object.entries(attrs).forEach(([k,v]) => {
+    if (k === 'className') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2).toLowerCase(), v);
+    else e.setAttribute(k, v);
+  });
+  kids.forEach(k => { if (typeof k === 'string') e.appendChild(document.createTextNode(k)); else if (k) e.appendChild(k); });
+  return e;
+}
+
+function render() {
+  $('content').innerHTML = '';
+  if (activeTab === 'shell') renderShell();
+  else if (activeTab === 'fs') renderFS();
+  else if (activeTab === 'fleet') renderFleet();
+  else if (activeTab === 'bg') renderBackground();
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === activeTab));
+}
+
+async function renderShell() {
+  const c = $('content');
+  c.innerHTML = '<h2>Shell</h2>';
+  
+  const cmdRow = el('div', {className: 'inline-flex mb-8'});
+  const input = el('input', {id: 'shell-input', placeholder: 'enter command...', style: 'flex:1;min-width:200px'});
+  const runBtn = el('button', {className: 'primary', id: 'shell-run'}, 'Run');
+  cmdRow.append(input, runBtn);
+  c.appendChild(cmdRow);
+
+  const clearBtn = el('button', {className: 'secondary', id: 'shell-clear'}, 'Clear');
+  c.appendChild(clearBtn);
+  c.appendChild(el('pre', {id: 'shell-output'}, '> ready\n'));
+
+  $('shell-run').onclick = () => runCommand($('shell-input').value);
+  $('shell-input').onkeydown = e => { if (e.key === 'Enter') runCommand(e.target.value); };
+  $('shell-clear').onclick = () => { $('shell-output').textContent = '> cleared\n'; };
+}
+
+async function runCommand(cmd) {
+  if (!cmd.trim()) return;
+  const pre = $('shell-output');
+  pre.textContent += `$ ${cmd}\n`;
+  $('shell-input').value = '';
+  try {
+    const r = await api('/api/v1/shell/run', {
+      method: 'POST', body: JSON.stringify({command: cmd, timeout_secs: 30}),
+    });
+    if (r.stdout) pre.textContent += r.stdout;
+    if (r.stderr) pre.textContent += `\x1b[31m${r.stderr}\x1b[0m`;
+    pre.textContent += r.exit_code === 0 ? '' : `\nexit: ${r.exit_code}`;
+    if (r.timed_out) pre.textContent += '\n[timed out]';
+    pre.textContent += '\n';
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) { pre.textContent += `error: ${e.message}\n`; }
+}
+
+async function renderFS() {
+  const c = $('content');
+  c.innerHTML = '<h2>Filesystem</h2>';
+  
+  const pathRow = el('div', {className: 'inline-flex mb-8'});
+  const input = el('input', {id: 'fs-path', value: '/home/ubuntu/.openclaw/workspace', style: 'flex:1;min-width:200px'});
+  const browseBtn = el('button', {className: 'primary'}, 'Browse');
+  pathRow.append(input, browseBtn);
+  c.appendChild(pathRow);
+  c.appendChild(el('pre', {id: 'fs-output'}, 'browse a directory...\n'));
+
+  const readerow = el('div', {className: 'inline-flex mb-8 mt-8'});
+  const readInput = el('input', {id: 'fs-read-path', placeholder: '/path/to/file', style: 'flex:1;min-width:200px'});
+  const readBtn = el('button', {className: 'secondary'}, 'Read');
+  readerow.append(readInput, readBtn);
+  c.appendChild(readerow);
+  c.appendChild(el('pre', {id: 'fs-read-output', style: 'max-height:300px'}, ''));
+
+  browseBtn.onclick = async () => {
+    const pre = $('fs-output');
+    pre.textContent = 'loading...\n';
+    try {
+      const entries = await api(`/api/v1/fs/tree?path=${encodeURIComponent($('fs-path').value)}`);
+      pre.textContent = entries.map(e => `  ${e}`).join('\n') + '\n';
+    } catch(e) { pre.textContent = `error: ${e.message}\n`; }
+  };
+  readBtn.onclick = async () => {
+    const pre = $('fs-read-output');
+    pre.textContent = 'loading...\n';
+    try {
+      const r = await api(`/api/v1/fs/read?path=${encodeURIComponent($('fs-read-path').value)}`);
+      pre.textContent = r.content || '(empty)';
+    } catch(e) { pre.textContent = `error: ${e.message}\n`; }
+  };
+  
+  input.onkeydown = e => { if (e.key === 'Enter') browseBtn.click(); };
+  readInput.onkeydown = e => { if (e.key === 'Enter') readBtn.click(); };
+}
+
+async function renderFleet() {
+  const c = $('content');
+  c.innerHTML = '<h2>Fleet Status</h2><div class="grid-2" id="fleet-grid"></div><div id="fleet-detail" class="mt-8"></div>';
+  
+  async function refresh() {
+    try {
+      const s = await api('/api/v1/fleet/status');
+      const grid = $('fleet-grid');
+      grid.innerHTML = '';
+      const services = [
+        {name: 'PLATO', key: 'plato', port: 8847, desc: 'Knowledge manifold'},
+        {name: 'Visual Mesh', key: 'visual_mesh', port: 8400, desc: 'Visual memory layer'},
+        {name: 'Keeper', key: 'keeper', port: 8900, desc: 'Auth & routing'},
+      ];
+      services.forEach(svc => {
+        const up = s[svc.key];
+        const card = el('div', {className: 'card'});
+        card.innerHTML = `
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+            <span class="status-dot ${up ? 'status-up' : 'status-down'}"></span>
+            <strong>${svc.name}</strong>
+          </div>
+          <div style="color:#8b949e;font-size:12px">${svc.desc}</div>
+          <div style="color:#8b949e;font-size:11px;margin-top:4px">port ${svc.port}</div>
+        `;
+        grid.appendChild(card);
+      });
+    } catch(e) { $('fleet-grid').innerHTML = `<div class="card">error: ${e.message}</div>`; }
+  }
+  
+  // Casting call
+  const ccHtml = `
+    <div class="card">
+      <label for="cc-task">Task Type</label>
+      <select id="cc-task" style="margin-bottom:8px">
+        <option value="code_review">Code Review</option>
+        <option value="deep_reasoning">Deep Reasoning</option>
+        <option value="architecture">Architecture</option>
+        <option value="creative">Creative</option>
+        <option value="research">Research</option>
+        <option value="quick_fix">Quick Fix</option>
+        <option value="arithmetic">Arithmetic</option>
+        <option value="visual_memory">Visual Memory</option>
+      </select>
+      <div style="display:flex;gap:8px">
+        <button class="primary" id="cc-select">Select Model</button>
+      </div>
+      <pre id="cc-result" class="mt-8">(select a task)</pre>
+    </div>
+  `;
+  $('fleet-detail').insertAdjacentHTML('beforeend', ccHtml);
+  
+  $('cc-select').onclick = async () => {
+    try {
+      const r = await api('/api/v1/fleet/casting/select', {
+        method: 'POST', body: JSON.stringify({task: $('cc-task').value})
+      });
+      $('cc-result').textContent = JSON.stringify(r, null, 2);
+    } catch(e) { $('cc-result').textContent = `error: ${e.message}`; }
+  };
+  
+  refresh();
+}
+
+async function renderBackground() {
+  const c = $('content');
+  c.innerHTML = '<h2>Background Processes</h2><div id="bg-list"></div>';
+  
+  async function refresh() {
+    try {
+      const list = await api('/api/v1/shell/bg/list');
+      const div = $('bg-list');
+      div.innerHTML = '';
+      if (!list.length) { div.innerHTML = '<div class="card" style="color:#8b949e">no background processes</div>'; return; }
+      list.forEach(p => {
+        const card = el('div', {className: 'card'});
+        card.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <strong>#${p.handle}: ${p.command?.substring(0,60)}</strong>
+            <span style="color:${p.running ? '#3fb950' : '#da3633'};font-size:12px">${p.running ? 'running' : 'exited'}</span>
+          </div>
+          <div style="color:#8b949e;font-size:11px">pid: ${p.pid || '-'}</div>
+          <div class="mt-8 inline-flex">
+            <button class="secondary" data-handle="${p.handle}" data-action="logs">Logs</button>
+            <button class="danger" data-handle="${p.handle}" data-action="kill">Kill</button>
+          </div>
+          <pre class="mt-8 hidden" data-handle="${p.handle}" data-log></pre>
+        `;
+        card.querySelector('[data-action=logs]').onclick = async () => {
+          const log = card.querySelector('[data-log]');
+          try {
+            const r = await api('/api/v1/shell/bg/logs', {
+              method: 'POST', body: JSON.stringify({handle: p.handle})
+            });
+            log.textContent = r.lines?.map(l => l.text).join('') || '(no output)';
+            log.classList.remove('hidden');
+          } catch(e) { log.textContent = `error: ${e.message}`; log.classList.remove('hidden'); }
+        };
+        card.querySelector('[data-action=kill]').onclick = async () => {
+          try { await api('/api/v1/shell/bg/kill', {method: 'POST', body: JSON.stringify({handle: p.handle})}); refresh(); }
+          catch(e) { alert(e.message); }
+        };
+        div.appendChild(card);
+      });
+    } catch(e) { $('bg-list').innerHTML = `<div class="card">error: ${e.message}</div>`; }
+  }
+  
+  const refreshBtn = el('button', {className: 'secondary mb-8'}, 'Refresh');
+  refreshBtn.onclick = refresh;
+  c.insertBefore(refreshBtn, $('bg-list'));
+  refresh();
+}
+
+function switchTab(tab) {
+  activeTab = tab;
+  render();
+}
+
+// Initial render
+document.getElementById('app').innerHTML = `
+  <header>
+    <h1>⌨️ Terax Shell</h1>
+    <nav>
+      <button data-tab="shell" onclick="switchTab('shell')">Shell</button>
+      <button data-tab="fs" onclick="switchTab('fs')">Filesystem</button>
+      <button data-tab="fleet" onclick="switchTab('fleet')">Fleet</button>
+      <button data-tab="bg" onclick="switchTab('bg')">Processes</button>
+    </nav>
+  </header>
+  <div id="content"></div>
+  <div class="status-bar" id="status-bar">
+    <span id="status-plato">PLATO: —</span>
+    <span id="status-mesh">Mesh: —</span>
+    <span id="status-keeper">Keeper: —</span>
+  </div>
+`;
+render();
+
+// Status bar refresh
+setInterval(async () => {
+  try {
+    const s = await api('/api/v1/fleet/status');
+    $('status-plato').innerHTML = `PLATO: <span class="status-dot ${s.plato ? 'status-up' : 'status-down'}"></span>`;
+    $('status-mesh').innerHTML = `Mesh: <span class="status-dot ${s.visual_mesh ? 'status-up' : 'status-down'}"></span>`;
+    $('status-keeper').innerHTML = `Keeper: <span class="status-dot ${s.keeper ? 'status-up' : 'status-down'}"></span>`;
+  } catch(e) { /* service not up yet */ }
+}, 10000);
+</script>
+</body></html>
