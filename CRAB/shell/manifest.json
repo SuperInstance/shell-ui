@@ -1,0 +1,12 @@
+{
+  "name": "shell-ui",
+  "family": "web",
+  "version": "0.1.0",
+  "entry": ".",
+  "type": "web",
+  "commands": [
+    "npm run build",
+    "npm start"
+  ]
+}
+
